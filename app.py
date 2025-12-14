@@ -1,5 +1,6 @@
 """
 Flask application with API routes - OPTIMIZED & AGNOSTIC VERSION
+Flask application - FULLY INTEGRATED DYNAMIC DASHBOARD VERSION
 """
 from flask import Flask, Response, jsonify, request
 import cv2
@@ -21,6 +22,7 @@ from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure
 from flask_mail import Mail, Message
 from flask_socketio import SocketIO, emit 
+from bson.objectid import ObjectId # Required for MongoDB ID handling
 
 
 # --- IMPORT CUSTOM AI MODULE (CRITICAL FOR ACCURACY) ---
@@ -38,6 +40,7 @@ bcrypt = Bcrypt(app)
 
 
 # [Change] Initialize SocketIO with async_mode to ensure non-blocking behavior
+# Initialize SocketIO with async_mode to ensure non-blocking behavior
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 
@@ -65,9 +68,17 @@ try:
     )
     client.admin.command('ping') 
     db = client[DB_NAME]
+    
+    # User & Auth Collections
     users_collection = db['users']
     otp_collection = db['otps']
     sessions_collection = db['sessions']
+    
+    # NEW Collections for Dynamic Dashboard
+    exercises_collection = db['exercises']
+    protocols_collection = db['protocols']
+    notifications_collection = db['notifications']
+    
     print(f"✅ Connected to MongoDB Cloud: {DB_NAME}")
 except Exception as e:
     print(f"⚠️ DB Error: {e}")
@@ -102,7 +113,7 @@ def generate_video_frames():
         if not should_continue or frame is None:
             break
         
-        # [Critical Fix] Emit data and SLEEP to allow other requests (like Stop) to process
+        # Emit data and SLEEP to allow other requests (like Stop) to process
         socketio.emit('workout_update', workout_session.get_state_dict())
         socketio.sleep(0.01) # Yield control for 10ms
 
@@ -140,7 +151,7 @@ def _get_frontend_exercise_list():
     return [e for e in exercise_list if 'title' in e]
 
 
-# --- 3. SOCKET EVENTS (NEW) ---
+# --- 3. SOCKET EVENTS ---
 
 
 @socketio.on('connect')
@@ -219,7 +230,14 @@ def signup_verify():
     if not record or record['otp'] != data.get('otp'):
         return jsonify({'error': 'Invalid or expired OTP'}), 400
     hashed_password = bcrypt.generate_password_hash(data['password']).decode('utf-8')
-    user = {'name': data['name'], 'email': data['email'], 'password': hashed_password, 'role': data.get('role', 'patient'), 'created_at': time.time(), 'auth_method': 'email'}
+    user = {
+        'name': data['name'], 
+        'email': data['email'], 
+        'password': hashed_password, 
+        'role': data.get('role', 'patient'), 
+        'created_at': time.time(), 
+        'auth_method': 'email'
+    }
     users_collection.insert_one(user)
     otp_collection.delete_one({'email': data['email']}) 
     return jsonify({'message': 'User verified', 'user': {'name': user['name'], 'role': user['role']}}), 201
@@ -231,7 +249,12 @@ def login():
     data = request.json
     user = users_collection.find_one({'email': data['email']})
     if user and bcrypt.check_password_hash(user['password'], data['password']):
-        return jsonify({'message': 'Login successful', 'role': user['role'], 'name': user['name'], 'email': user['email']}), 200
+        return jsonify({
+            'message': 'Login successful', 
+            'role': user['role'], 
+            'name': user['name'], 
+            'email': user['email']
+        }), 200
     return jsonify({'error': 'Invalid credentials'}), 401
 
 
@@ -246,12 +269,25 @@ def google_auth():
         email = google_user['email']
         user = users_collection.find_one({'email': email})
         if not user:
-            user = {'name': google_user['name'], 'email': email, 'password': '', 'role': 'patient', 'created_at': time.time(), 'auth_method': 'google'}
+            user = {
+                'name': google_user['name'], 
+                'email': email, 
+                'password': '', 
+                'role': 'patient', 
+                'created_at': time.time(), 
+                'auth_method': 'google'
+            }
             users_collection.insert_one(user)
-        return jsonify({'message': 'Google login successful', 'role': user['role'], 'name': user['name'], 'email': user['email']}), 200
+        return jsonify({
+            'message': 'Google login successful', 
+            'role': user['role'], 
+            'name': user['name'], 
+            'email': user['email']
+        }), 200
     except Exception as e:
         return jsonify({'error': 'Authentication failed'}), 500
 
+# --- ANALYTICS ROUTES ---
 
 @app.route('/api/user/stats', methods=['POST'])
 def get_user_stats():
@@ -261,13 +297,23 @@ def get_user_stats():
     total_reps = sum(s.get('total_reps', 0) for s in user_sessions)
     accuracy = 100
     if total_reps > 0: accuracy = max(0, 100 - int((sum(s.get('total_errors', 0) for s in user_sessions) / total_reps) * 20))
-    return jsonify({'total_workouts': len(user_sessions), 'total_reps': total_reps, 'accuracy': accuracy, 'graph_data': [{'date': s.get('date'), 'reps': s.get('total_reps', 0)} for s in user_sessions[-7:]]})
+    return jsonify({
+        'total_workouts': len(user_sessions), 
+        'total_reps': total_reps, 
+        'accuracy': accuracy, 
+        'graph_data': [{'date': s.get('date'), 'reps': s.get('total_reps', 0)} for s in user_sessions[-7:]]
+    })
 
 
 @app.route('/api/user/analytics_detailed', methods=['POST'])
 def get_analytics_detailed():
-    if sessions_collection is None: return jsonify({'error': 'DB Error'}), 503
-    return jsonify(AIEngine.get_detailed_analytics(list(sessions_collection.find({'email': request.json.get('email')}).sort('timestamp', 1))))
+    if sessions_collection is None: 
+        return jsonify({'error': 'DB Error'}), 503
+    
+    try:
+        email = request.json.get('email')
+        if not email:
+            return jsonify({'error': 'Email required'}), 400
 
 
 @app.route('/api/user/ai_prediction', methods=['POST'])
@@ -324,6 +370,67 @@ def stop_tracking_http():
         return jsonify({'status': 'error'}), 500
 
 
+        # 1. Fetch all sessions for this user, sorted by newest first
+        sessions = list(sessions_collection.find({'email': email}).sort('timestamp', -1))
+        
+        if not sessions:
+            return jsonify({
+                'total_sessions': 0,
+                'total_reps': 0,
+                'average_accuracy': 0,
+                'history': []
+            })
+
+        # 2. Calculate Stats Manually
+        total_sessions = len(sessions)
+        total_reps = 0
+        total_accuracy_sum = 0
+        history_list = []
+
+        for s in sessions:
+            # Get basic fields safely
+            s_reps = s.get('total_reps', 0)
+            s_errors = s.get('total_errors', 0)
+            s_exercise = s.get('exercise', 'Unknown')
+            
+            # Format Date
+            s_date = "Unknown"
+            if 'timestamp' in s:
+                s_date = datetime.fromtimestamp(s['timestamp']).strftime('%Y-%m-%d %H:%M')
+            elif 'date' in s:
+                s_date = s['date']
+
+            # Calculate Session Accuracy
+            s_accuracy = 0
+            if s_reps > 0:
+                # Formula: 100 - (20% penalty per error), min 0
+                s_accuracy = max(0, 100 - int((s_errors / s_reps) * 20))
+            
+            # Add to totals
+            total_reps += s_reps
+            total_accuracy_sum += s_accuracy
+
+            # Add to history list
+            history_list.append({
+                'date': s_date,
+                'exercise': s_exercise,
+                'reps': s_reps,
+                'accuracy': s_accuracy
+            })
+
+        # 3. Final Averages
+        avg_accuracy = int(total_accuracy_sum / total_sessions) if total_sessions > 0 else 0
+
+        return jsonify({
+            'total_sessions': total_sessions,
+            'total_reps': total_reps,
+            'average_accuracy': avg_accuracy,
+            'history': history_list
+        })
+
+    except Exception as e:
+        print(f"Analytics Error: {e}")
+        return jsonify({'error': str(e)}), 500
 @app.route('/video_feed')
 def video_feed():
     return Response(generate_video_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
@@ -338,5 +445,5 @@ def report_data():
 if __name__ == '__main__':
     # Initial session setup (using default name)
     init_session()
-    # [Critical] Use socketio.run
-    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
+    # Use socketio.run instead of app.run
+    socketio.run(app, host='0.0.0.0', port=5001, debug=True)
